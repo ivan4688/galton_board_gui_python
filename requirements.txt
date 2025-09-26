@@ -1,0 +1,6 @@
+sqlite3
+shutil
+threading
+tkinter
+matplotlib
+numpy
