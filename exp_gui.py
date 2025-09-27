@@ -1,4 +1,8 @@
-
+# -*- coding: utf-8 -*-
+"""
+Galton Interactive — окончательный исполняемый скрипт
+(Обновление: анимация закрывается автоматически и сразу запускает сохранение)
+"""
 import os
 import sys
 import time
@@ -9,17 +13,19 @@ import sqlite3
 import threading
 import subprocess
 import shutil
+import webbrowser
 from datetime import datetime
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, scrolledtext
 
 import numpy as np
 import matplotlib
 import matplotlib.font_manager as fm
-import matplotlib.pyplot as plt  # used only for close()
+import matplotlib.pyplot as plt  # only for compatibility closing
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.ticker as mticker
 
 # ---------------- Reliable Cyrillic font selection ----------------
 _candidates = ["DejaVu Sans", "Arial", "Liberation Sans", "Tahoma"]
@@ -46,6 +52,7 @@ matplotlib.rcParams['font.size'] = 11
 GLOBAL_FONT_PROP = fm.FontProperties(fname=_chosen_path, size=11)
 GLOBAL_MONO_FONT_PROP = fm.FontProperties(fname=_chosen_path, size=10)
 
+# ---------------- Theme colors ----------------
 BG = "#f7f9fb"
 PANEL_BG = "#ffffff"
 CARD_BG = "#eef6ff"
@@ -61,6 +68,7 @@ ANIM_TEXT = "#e8f1ff"
 ANIM_PEG = "#cfe9ff"
 ANIM_PEG_OUTLINE = "#093042"
 
+# Matplotlib defaults
 matplotlib.rcParams['figure.facecolor'] = PANEL_BG
 matplotlib.rcParams['axes.facecolor'] = PANEL_BG
 matplotlib.rcParams['savefig.facecolor'] = "white"
@@ -72,6 +80,16 @@ matplotlib.rcParams['axes.edgecolor'] = "#2a3f50"
 
 # ---------------- Database ----------------
 DB_PATH = "galton_runs.db"
+
+
+def sqlite_connect(path=DB_PATH, timeout=30):
+    conn = sqlite3.connect(path, timeout=timeout, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        pass
+    return conn
+
 
 def migrate_db_schema(db_path=DB_PATH):
     expected_cols = {
@@ -90,7 +108,7 @@ def migrate_db_schema(db_path=DB_PATH):
         "images": "TEXT",
         "run_folder": "TEXT"
     }
-    conn = sqlite3.connect(db_path)
+    conn = sqlite_connect(db_path)
     cur = conn.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='runs'")
     if cur.fetchone() is None:
@@ -101,19 +119,18 @@ def migrate_db_schema(db_path=DB_PATH):
         conn.close()
         return
     cur.execute("PRAGMA table_info(runs)")
-    existing = [row[1] for row in cur.fetchall()]  # (cid, name, type, ...)
+    existing = [row[1] for row in cur.fetchall()]
     for col, typ in expected_cols.items():
         if col in existing:
             continue
         try:
             alter_sql = f"ALTER TABLE runs ADD COLUMN {col} {typ}"
             cur.execute(alter_sql)
-            print(f"[DB MIGRATE] added column '{col}'")
-        except Exception as e:
-            # log and continue
-            print(f"[DB MIGRATE] failed to add column '{col}': {e}")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
+
 
 def init_db(db_path=DB_PATH):
     db_dir = os.path.dirname(os.path.abspath(db_path))
@@ -121,13 +138,14 @@ def init_db(db_path=DB_PATH):
         os.makedirs(db_dir, exist_ok=True)
     migrate_db_schema(db_path)
 
+
 def save_run_to_db(params, metrics, counts, image_paths, duration, run_folder=None, db_path=DB_PATH):
     try:
         counts_list = list(counts)
     except Exception:
         counts_list = counts if isinstance(counts, list) else []
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite_connect(db_path)
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO runs (ts, n, num_balls, batch_size, speed, pause, duration, avg_rel_dev_pct, corr, chi2, counts, images, run_folder)
@@ -155,8 +173,9 @@ def save_run_to_db(params, metrics, counts, image_paths, duration, run_folder=No
         print("[DB SAVE] error:", err)
         return None
 
+
 def load_all_runs(db_path=DB_PATH):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite_connect(db_path)
     cur = conn.cursor()
     try:
         cur.execute("""
@@ -333,7 +352,11 @@ def generate_and_save_plots(counts, n_levels, num_balls, outdir, progress_callba
             pass
         fig.savefig(path, dpi=140)
         try:
-            plt.close(fig)
+            fig.clf()
+        except Exception:
+            pass
+        try:
+            del fig
         except Exception:
             pass
         saved.append(path)
@@ -372,6 +395,7 @@ def generate_and_save_plots(counts, n_levels, num_balls, outdir, progress_callba
     ax3 = fig3.add_subplot(111)
     ax3.bar(ks, obs, alpha=0.9, color=BAR_FILL)
     ax3.set_xticks(ks)
+    ax3.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax3.set_xlabel("Номер корзины (k)", fontproperties=GLOBAL_FONT_PROP)
     ax3.set_ylabel("Число шариков", fontproperties=GLOBAL_FONT_PROP)
     ax3.set_title("Гистограмма: counts", fontproperties=GLOBAL_FONT_PROP)
@@ -392,6 +416,7 @@ def generate_and_save_plots(counts, n_levels, num_balls, outdir, progress_callba
     ys = [normal_pdf(x, mu, sigma) for x in xs]
     ax4.plot(xs, ys, linewidth=2, label="Норм. аппрокс. (плотность)")
     ax4.set_xticks(ks)
+    ax4.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax4.set_xlabel("k", fontproperties=GLOBAL_FONT_PROP)
     ax4.set_ylabel("Частота / Вероятность", fontproperties=GLOBAL_FONT_PROP)
     ax4.set_title("Сравнение: нормаль, биномиал, эксперимент", fontproperties=GLOBAL_FONT_PROP)
@@ -406,6 +431,7 @@ def generate_and_save_plots(counts, n_levels, num_balls, outdir, progress_callba
     ax5.bar(ks - 0.18, obs, width=0.35, label="Эксперимент (числа)")
     ax5.bar(ks + 0.18, exp, width=0.35, label="Ожидаемые (биномиал)")
     ax5.set_xticks(ks)
+    ax5.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax5.set_xlabel("k", fontproperties=GLOBAL_FONT_PROP)
     ax5.set_ylabel("Число шариков", fontproperties=GLOBAL_FONT_PROP)
     ax5.set_title("Наблюдаемое vs Ожидаемое (биномиал)", fontproperties=GLOBAL_FONT_PROP)
@@ -414,7 +440,6 @@ def generate_and_save_plots(counts, n_levels, num_balls, outdir, progress_callba
     path5 = os.path.join(outdir, "observed_vs_expected.png")
     save_fig_and_step(fig5, path5, 5, "Obs vs Exp сохранено")
 
-    # metadata.json
     metadata = {
         "ts": datetime.utcnow().isoformat(timespec="seconds"),
         "n": int(n_levels),
@@ -433,9 +458,9 @@ def generate_and_save_plots(counts, n_levels, num_balls, outdir, progress_callba
 # ---------------- Galton animator (dark themed) ----------------
 class GaltonBoardAnimator(tk.Toplevel):
     def __init__(self, master, n_levels=10, num_balls=500, pixels_per_second=240.0,
-                 batch_size=50, batch_pause=0.5, canvas_w=1200, canvas_h=680, on_finish=None):
+                 batch_size=50, batch_pause=0.5, canvas_w=1200, canvas_h=680, on_finish=None, release_interval_sec=None):
         super().__init__(master)
-        self.title("Galton Board. © Иван Голиков 9М")
+        self.title("Galton Board — анимация")
         self.resizable(False, False)
         self.on_finish = on_finish
 
@@ -445,6 +470,8 @@ class GaltonBoardAnimator(tk.Toplevel):
         self.pixels_per_second = float(pixels_per_second)
         self.batch_size = max(1, int(batch_size)); self.batch_pause = float(batch_pause)
         self.frame_ms = 16
+        # release_interval_sec: if provided (>0) -> release balls one-by-one with this interval
+        self.release_interval_ms = int(release_interval_sec * 1000) if (release_interval_sec is not None and release_interval_sec > 0) else None
 
         # style
         self.bg_color = ANIM_BG; self.card_color = ANIM_CARD; self.text_color = ANIM_TEXT
@@ -509,7 +536,7 @@ class GaltonBoardAnimator(tk.Toplevel):
 
         self.canvas = tk.Canvas(self, width=self.canvas_w, height=self.canvas_h, bg=self.card_color, highlightthickness=0)
         self.canvas.pack(padx=6, pady=(0,6))
-        foot = tk.Label(self, text="© Голиков Иван 9М", bg=self.bg_color, fg="#b8d6ff", font=("Helvetica", 10, "italic"))
+        foot = tk.Label(self, text="© Галтовская анимация", bg=self.bg_color, fg="#b8d6ff", font=("Helvetica", 10, "italic"))
         foot.pack(side="bottom", pady=(0,4))
 
     def _compute_pegs(self):
@@ -571,7 +598,6 @@ class GaltonBoardAnimator(tk.Toplevel):
                 text_y = y - self.peg_radius - 8
                 font_size = max(7, int(self.peg_spacing_x * 0.12))
                 font = ("Helvetica", font_size, "bold")
-                # shadow + white main text
                 self.canvas.create_text(x+1, text_y+1, text=str(val), font=font, fill="#02101a")
                 self.canvas.create_text(x, text_y, text=str(val), font=font, fill="#ffffff")
         self.bin_rects = []; self.bin_bar_ids = []; self.bin_texts = []
@@ -584,6 +610,19 @@ class GaltonBoardAnimator(tk.Toplevel):
             txt = self.canvas.create_text(x, bottom+18, text="0", fill=self.text_color, font=("Helvetica", 10))
             self.bin_bar_ids.append(bar); self.bin_texts.append(txt)
             self.canvas.create_text(x, bottom+34, text=str(k), fill=self.text_color, font=("Helvetica", 9))
+
+    def _smooth_path(self, pts):
+        if len(pts) < 3:
+            return pts
+        out = [pts[0]]
+        for i in range(len(pts)-1):
+            p0 = pts[i]; p1 = pts[i+1]
+            mx = (p0[0] + p1[0]) / 2.0
+            my = (p0[1] + p1[1]) / 2.0
+            offset = max(6.0, abs(p1[0]-p0[0]) * 0.15)
+            out.append((mx, my + offset))
+            out.append(p1)
+        return out
 
     def start(self):
         if self.running:
@@ -600,21 +639,126 @@ class GaltonBoardAnimator(tk.Toplevel):
             self.canvas.itemconfigure(self.bin_texts[k], text="0")
         self._current_launched = 0
         self.run_start_time = time.time()
-        self._animate_batches()
+        # if release_interval_ms is set -> single release mode (one-by-one at given interval)
+        if self.release_interval_ms is not None:
+            self._active_balls = []
+            self._schedule_release()
+            self._continuous_tick()
+        else:
+            # fallback: batch mode
+            self._animate_batches()
 
     def stop(self):
         self.running = False
         self._stop_requested = True
         self.start_btn.config(state="normal"); self.stop_btn.config(state="normal")
 
+    def _schedule_release(self):
+        if (not self.running) or (self._current_launched >= self.num_balls):
+            return
+        flips = [random.choice([0,1]) for _ in range(self.n)]
+        start_x = self.canvas_w // 2; start_y = max(50, self.top_y - 32)
+        pts = [(start_x, start_y)]
+        rights = 0
+        for row_idx in range(self.n):
+            peg_x, peg_y = self.peg_positions[row_idx][rights]
+            pts.append((peg_x, peg_y))
+            if flips[row_idx] == 1:
+                rights += 1
+        bin_x, bin_y = self.bin_centers[rights]
+        pts.append((bin_x, bin_y - 22))
+        smooth_pts = self._smooth_path(pts)
+        L = polyline_length(smooth_pts)
+        tag = f"ball_{self._current_launched}_{random.randint(1,999999)}"
+        r = self.ball_radius
+        oval = self.canvas.create_oval(start_x-r, start_y-r, start_x+r, start_y+r, fill=self.bar_fill, outline="#7a4f0f", tags=(tag,))
+        ball = {"tag": tag, "pts": smooth_pts, "L": L, "s": 0.0, "final_k": rights, "pos": (start_x, start_y), "finished": False}
+        self._active_balls.append(ball)
+        self._current_launched += 1
+        # schedule next release
+        if self.running and self._current_launched < self.num_balls:
+            self.after(self.release_interval_ms, self._schedule_release)
+
+    def _continuous_tick(self):
+        # if stopped and no active balls -> finish
+        if (not self.running) and (not getattr(self, '_active_balls', [])):
+            duration = time.time() - (self.run_start_time or time.time())
+            # call on_finish synchronously so saving can start immediately
+            try:
+                if callable(self.on_finish):
+                    self.on_finish(self.get_counts(), duration)
+            except Exception as e:
+                print("[ON_FINISH] error:", e)
+            self._safe_destroy()
+            return
+
+        delta = self.pixels_per_second * (self.frame_ms / 1000.0)
+        for b in list(getattr(self, '_active_balls', [])):
+            if b["finished"]:
+                continue
+            b["s"] += delta
+            if b["s"] >= b["L"]:
+                x,y = b["pts"][-1]; cx,cy = b["pos"]
+                dx = x - cx; dy = y - cy
+                if abs(dx)>1e-6 or abs(dy)>1e-6:
+                    try: self.canvas.move(b["tag"], dx, dy)
+                    except: pass
+                    b["pos"] = (x,y)
+                b["finished"] = True
+                k = b["final_k"]; self.bin_counts[k] += 1
+                count = self.bin_counts[k]
+                probs = binomial_pmf(self.n)
+                max_prob = max(probs) if probs else 1.0
+                est_peak = max_prob * self.num_balls
+                if est_peak > 0:
+                    h_per_ball = max(0.2, self.hist_max_vis_height / (est_peak * 1.4))
+                else:
+                    h_per_ball = 1.0
+                left, top, right, bottom = self.bin_rects[k]
+                filled_height = min(count * h_per_ball, self.hist_max_vis_height)
+                new_top = bottom - 6 - filled_height
+                try:
+                    self.canvas.coords(self.bin_bar_ids[k], left+6, new_top, right-6, bottom-6)
+                    self.canvas.itemconfigure(self.bin_texts[k], text=str(count))
+                except Exception:
+                    pass
+                try: self.canvas.delete(b["tag"])
+                except: pass
+                try:
+                    self._active_balls.remove(b)
+                except Exception:
+                    pass
+            else:
+                new_pos = point_at_distance(b["pts"], b["s"])
+                cx,cy = b["pos"]
+                dx = new_pos[0] - cx; dy = new_pos[1] - cy
+                if abs(dx)>1e-6 or abs(dy)>1e-6:
+                    try: self.canvas.move(b["tag"], dx, dy)
+                    except: pass
+                    b["pos"] = new_pos
+        # continue ticking or finish if no more work
+        if self.running or getattr(self, '_active_balls', []):
+            self.after(self.frame_ms, self._continuous_tick)
+        else:
+            duration = time.time() - (self.run_start_time or time.time())
+            try:
+                if callable(self.on_finish):
+                    self.on_finish(self.get_counts(), duration)
+            except Exception as e:
+                print("[ON_FINISH] error:", e)
+            self._safe_destroy()
+
     def _animate_batches(self):
         if (not self.running) or (self._current_launched >= self.num_balls):
             self.running = False
             self.start_btn.config(state="normal"); self.stop_btn.config(state="normal")
             duration = time.time() - (self.run_start_time or time.time())
-            if callable(self.on_finish):
-                self.after(50, lambda: self.on_finish(self.get_counts(), duration))
-            self.after(300, lambda: self._safe_destroy())
+            try:
+                if callable(self.on_finish):
+                    self.on_finish(self.get_counts(), duration)
+            except Exception as e:
+                print("[ON_FINISH] error:", e)
+            self._safe_destroy()
             return
 
         remaining = self.num_balls - self._current_launched
@@ -635,12 +779,12 @@ class GaltonBoardAnimator(tk.Toplevel):
                     rights += 1
             bin_x, bin_y = self.bin_centers[rights]
             pts.append((bin_x, bin_y - 22))
-            L = polyline_length(pts)
+            smooth_pts = self._smooth_path(pts)
+            L = polyline_length(smooth_pts)
             tag = f"ball_{batch_id}_{i}_{random.randint(1,999999)}"
             r = self.ball_radius
-            # более шарообразный (с тенью через небольшую дугу) — простая реализация
             oval = self.canvas.create_oval(start_x-r, start_y-r, start_x+r, start_y+r, fill=self.bar_fill, outline="#7a4f0f", tags=(tag,))
-            balls.append({"tag": tag, "pts": pts, "L": L, "s": 0.0, "final_k": rights, "pos": (start_x, start_y), "finished": False})
+            balls.append({"tag": tag, "pts": smooth_pts, "L": L, "s": 0.0, "final_k": rights, "pos": (start_x, start_y), "finished": False})
 
         def batch_tick():
             if not self.running and self._stop_requested:
@@ -648,9 +792,12 @@ class GaltonBoardAnimator(tk.Toplevel):
                     try: self.canvas.delete(b["tag"])
                     except: pass
                 duration = time.time() - (self.run_start_time or time.time())
-                if callable(self.on_finish):
-                    self.after(50, lambda: self.on_finish(self.get_counts(), duration))
-                self.after(150, lambda: self._safe_destroy())
+                try:
+                    if callable(self.on_finish):
+                        self.on_finish(self.get_counts(), duration)
+                except Exception as e:
+                    print("[ON_FINISH] error:", e)
+                self._safe_destroy()
                 return
 
             delta = self.pixels_per_second * (self.frame_ms / 1000.0)
@@ -721,12 +868,15 @@ class GaltonBoardAnimator(tk.Toplevel):
         return self.bin_counts.copy()
 
     def _on_user_close(self):
-        # request stop and let on_finish handle saving of current counts
+        # user requested close -> stop and trigger on_finish immediately then destroy
         self.running = False; self._stop_requested = True
         duration = time.time() - (self.run_start_time or time.time())
-        if callable(self.on_finish):
-            self.after(50, lambda: self.on_finish(self.get_counts(), duration))
-        self.after(200, lambda: self._safe_destroy())
+        try:
+            if callable(self.on_finish):
+                self.on_finish(self.get_counts(), duration)
+        except Exception as e:
+            print("[ON_FINISH] error:", e)
+        self._safe_destroy()
 
     def _safe_destroy(self):
         try:
@@ -736,14 +886,55 @@ class GaltonBoardAnimator(tk.Toplevel):
             pass
 
 # ---------------- Main GUI ----------------
+HELP_TEXT = """
+От азартных игр к законам Вселенной: увлекательный путь теории вероятностей
+
+XVII век: Рождение из азарта
+
+Представьте: XVII век, Франция. Два математических титана — Блез Паскаль и Пьер Ферма — ведут оживлённую переписку. Повод? Отнюдь не абстрактные теоремы, а скандал среди азартных игроков! Как честно разделить ставку, если игра прервана до финала? Решая эту, казалось бы, приземлённую задачу, они заложили основы теории вероятностей. Главным инструментом расчёта шансов стал треугольник Паскаля — изящная числовая пирамида, позволяющая предсказать исходы множества испытаний.
+
+От идеала к реальности: прорыв Бернулли
+
+Но теория — одно дело, а жизнь — другое. Следующий прорыв совершил Якоб Бернулли. Он задался смелым вопросом: «А работают ли эти расчёты для чего-то большего, чем карты и кости? Для статистики рождений, данных переписей, реального хаоса жизни?» Ответом стал Закон больших чисел: да, хаос отдельных событий при большом их количестве подчиняется строгой закономерности!
+
+Что же происходит? Когда мы многократно повторяем одно и то же случайное испытание (например, подбрасываем монету), совокупность всех исходов начинает описываться биномиальным распределением. Оно точно показывает, как вероятность распределяется между различными количествами «успехов». И вот здесь начинается магия: Закон больших чисел утверждает, что частота успеха будет неуклонно стремиться к предсказанной биномиальным распределением вероятности. Случайность усредняется — проявляется порядок!
+
+Русский вклад: укрощение случайности
+
+Однако блестящую догадку Бернулли нужно было доказать с математической строгостью. Этим занялись гении русской школы. Пафнутий Чебышёв создал своё знаменитое неравенство Чебышёва — мощный инструмент, позволивший доказать, что закон Бернулли — не просто наблюдение, а железный математический факт. Его ученик, Андрей Марков, предложил ещё более универсальную оценку — неравенство Маркова, работающее даже при минимуме информации о ситуации.
+
+Великий синтез: рождение Гауссова колокола
+
+Куда же ведёт эта дорога? К величайшему обобщению! Математики заметили удивительную вещь: стоит нам начать складывать результаты множества независимых испытаний (то есть работать с биномиальным распределением при большом числе экспериментов), как его форма начинает меняться. Грубые «ступеньки» графика сглаживаются, превращаясь в удивительно плавную и симметричную кривую-колокол.
+
+Это и есть нормальное распределение, или «колокол Гаусса». Открытие, известное как Центральная предельная теорема, стало триумфом математической мысли. Вклад в него внесли Карл Фридрих Гаусс, Пьер-Симон Лаплас и Александр Ляпунов. Суть в том, что биномиальное распределение при стремлении числа испытаний к бесконечности не просто стабилизируется — оно стремится к нормальному! Эта универсальная закономерность проявляется повсюду: в ошибках измерений, росте людей, шумах и помехах.
+
+Наша лабораторная работа — машина времени!
+
+За полтора часа вы совершите увлекательное путешествие длиной в три столетия:
+
+1. Рассчитаете вероятность по треугольнику Паскаля, как это делали Паскаль и Ферма.
+2. Проверите на опыте Закон больших чисел Бернулли: увидите, как частота стабилизируется, стремясь к предсказаниям биномиального распределения.
+3. Оцените риски с помощью универсальных неравенств Чебышёва и Маркова.
+4. Станьте свидетелями чуда: увидите своими глазами, как при увеличении числа испытаний «ступеньки» биномиального распределения плавно превращаются в изящный Гауссов колокол — прямое подтверждение Центральной предельной теоремы!
+
+От бытового спора игроков — к универсальным законам, управляющим мирозданием. Вот мощь и красота теории вероятностей
+"""
+
+WIKI_ENTRIES = {
+    "Блез Паскаль": "https://ru.wikipedia.org/wiki/%D0%9F%D0%B0%D1%81%D0%BA%D0%B0%D0%BB%D1%8C,_%D0%91%D0%BB%D0%B5%D0%B7",
+    "Пьер Ферма": "https://ru.wikipedia.org/wiki/%D0%A4%D0%B5%D1%80%D0%BC%D0%B0,_%D0%9F%D1%8C%D0%B5%D1%80",
+    "Якоб Бернулли": "https://ru.wikipedia.org/wiki/%D0%91%D0%B5%D1%80%D0%BD%D1%83%D0%BB%D0%BB%D0%B8,_%D0%AF%D0%BA%D0%BE%D0%B1",
+    "Пафнутий Чебышёв": "https://ru.wikipedia.org/wiki/%D0%A7%D0%B5%D0%B1%D1%8B%D1%88%D1%91%D0%B2,_%D0%9F%D0%B0%D1%84%D0%BD%D1%83%D1%82%D0%B8%D0%B9",
+    "Андрей Марков": "https://ru.wikipedia.org/wiki/%D0%9C%D0%B0%D1%80%D0%BA%D0%BE%D0%B2,_%D0%90%D0%BD%D0%B4%D1%80%D0%B5%D0%B9",
+}
+
 class InteractiveGaltonApp:
     def __init__(self, root):
-        # Ensure DB migration executed early
         init_db()
         self.root = root
         self.root.title("Galton Interactive — © Голиков Иван 9М")
         self._build_ui()
-        # preload folder runs/ into DB
         self._preload_runs_folder_into_db()
         self._refresh_runs_list()
         self._update_aggregated_plots()
@@ -768,6 +959,10 @@ class InteractiveGaltonApp:
         ttk.Label(settings, text="Скорость (пикс/сек):").grid(row=row, column=0, sticky='e'); self.e_speed = ttk.Entry(settings, width=8); self.e_speed.insert(0, "240"); self.e_speed.grid(row=row, column=1, padx=6, pady=4)
         row += 1
         ttk.Label(settings, text="Пауза между партиями (с):").grid(row=row, column=0, sticky='e'); self.e_pause = ttk.Entry(settings, width=8); self.e_pause.insert(0, "0.05"); self.e_pause.grid(row=row, column=1, padx=6, pady=4)
+        row += 1
+        ttk.Label(settings, text="Интервал между шариками (с):").grid(row=row, column=0, sticky='e'); self.e_interval = ttk.Entry(settings, width=8); self.e_interval.insert(0, "0.05"); self.e_interval.grid(row=row, column=1, padx=6, pady=4)
+
+        ttk.Button(settings, text="Справка", command=self._open_help).grid(row=0, column=2, rowspan=2, padx=6)
 
         btns = ttk.Frame(left); btns.pack(fill='x', pady=6)
         self.btn_run_anim = ttk.Button(btns, text="Запустить анимированный прогон (авто-сохранение)", command=self._on_run_animated)
@@ -815,7 +1010,7 @@ class InteractiveGaltonApp:
         self.fig_pascal = Figure(figsize=(6,3), dpi=100); self.ax_pascal = self.fig_pascal.add_subplot(111); self.ax_pascal.axis('off')
         self.canvas_pascal = FigureCanvasTkAgg(self.fig_pascal, master=tab4); self.canvas_pascal.get_tk_widget().pack(fill='both', expand=True)
 
-    # ---------------- Preload runs folder into DB ----------------
+    # --------------- Preload / Runs actions (kept brief) ---------------
     def _preload_runs_folder_into_db(self):
         runs_root = os.path.abspath("runs")
         if not os.path.exists(runs_root):
@@ -842,9 +1037,11 @@ class InteractiveGaltonApp:
                     md = json.load(f)
                 counts = md.get("counts", [])
                 images = md.get("images", [])
-                metrics = md.get("metrics", md.get("metrics", {}))
-                params = {"n": md.get("n", len(counts)-1), "num_balls": md.get("num_balls", sum(counts)), "batch_size": md.get("batch_size", 0), "speed": md.get("speed", 0), "pause": md.get("pause", 0)}
-                duration = md.get("duration", 0.0)
+                metrics = md.get("metrics", {})
+                n_val = md.get("n", len(counts)-1)
+                n_val = max(0, int(n_val))
+                params = {"n": n_val, "num_balls": int(md.get("num_balls", sum(counts))), "batch_size": int(md.get("batch_size", 0)), "speed": float(md.get("speed", 0)), "pause": float(md.get("pause", 0))}
+                duration = float(md.get("duration", 0.0))
                 run_id = save_run_to_db(params, metrics, counts, images, duration, run_folder=folder)
                 if run_id:
                     imported += 1
@@ -853,22 +1050,23 @@ class InteractiveGaltonApp:
         if imported > 0:
             messagebox.showinfo("Импорт", f"Импортировано {imported} прогона(ов) из папки runs/.")
 
-    # ---------------- Run handlers ----------------
     def _on_run_animated(self):
         try:
             n = int(self.e_n.get()); num = int(self.e_balls.get())
             batch = int(self.e_batch.get()); speed = float(self.e_speed.get()); pause = float(self.e_pause.get())
+            interval = float(self.e_interval.get())
             if n < 1 or num < 1:
                 raise ValueError
         except Exception:
             messagebox.showerror("Ошибка", "Проверьте параметры (целые/числа)."); return
         self._set_running(True)
         self.status_var.set("Запуск анимированного прогона...")
+        release_interval = interval if interval > 0 else None
         animator = GaltonBoardAnimator(self.root, n_levels=n, num_balls=num, pixels_per_second=speed,
                                        batch_size=batch, batch_pause=pause, canvas_w=1200, canvas_h=680,
-                                       on_finish=lambda counts, duration: self._animator_done_callback(n, num, batch, speed, pause, counts, duration))
+                                       on_finish=lambda counts, duration: self._animator_done_callback(n, num, batch, speed, pause, counts, duration),
+                                       release_interval_sec=release_interval)
         animator.bind("<Destroy>", lambda ev, a=animator: self._on_animator_destroy(a, ev))
-        # start animation
         animator.start()
 
     def _on_animator_destroy(self, animator, event):
@@ -913,7 +1111,6 @@ class InteractiveGaltonApp:
             finally:
                 self.root.after(0, lambda: self._set_running(False))
 
-        # show modal progress dialog
         self._save_progress_dialog = SaveProgressDialog(self.root, title="Сохранение прогона", max_steps=100)
         self._save_progress_dialog.update_progress(2, "Подготовка...")
         threading.Thread(target=bg_save, daemon=True).start()
@@ -957,13 +1154,12 @@ class InteractiveGaltonApp:
 
     def _set_running(self, running):
         state = "disabled" if running else "normal"
-        for w in (getattr(self, 'e_n', None), getattr(self, 'e_balls', None), getattr(self, 'e_batch', None), getattr(self, 'e_speed', None), getattr(self, 'e_pause', None), getattr(self, 'btn_run_anim', None), getattr(self, 'btn_run_headless', None)):
+        for w in (getattr(self, 'e_n', None), getattr(self, 'e_balls', None), getattr(self, 'e_batch', None), getattr(self, 'e_speed', None), getattr(self, 'e_pause', None), getattr(self, 'e_interval', None), getattr(self, 'btn_run_anim', None), getattr(self, 'btn_run_headless', None)):
             try:
                 if w: w.config(state=state)
             except Exception:
                 pass
 
-    # ---------------- Runs list actions ----------------
     def _refresh_runs_list(self):
         for it in self.tree.get_children():
             self.tree.delete(it)
@@ -1064,7 +1260,7 @@ class InteractiveGaltonApp:
     def _clear_db_prompt(self):
         if not messagebox.askyesno("Подтвердите", "Удалить все записи из базы? Это действие необратимо."):
             return
-        conn = sqlite3.connect(DB_PATH); cur = conn.cursor(); cur.execute("DELETE FROM runs;"); conn.commit(); conn.close()
+        conn = sqlite_connect(DB_PATH); cur = conn.cursor(); cur.execute("DELETE FROM runs;"); conn.commit(); conn.close()
         self._refresh_runs_list(); self._update_aggregated_plots(); messagebox.showinfo("Готово", "База очищена.")
 
     # ---------------- Aggregated plots ----------------
@@ -1076,7 +1272,6 @@ class InteractiveGaltonApp:
             self.canvas_mean.draw(); self.canvas_norm.draw(); self.canvas_dev.draw(); self.canvas_pascal.draw()
             return
 
-        # pad counts arrays to same length (max n_levels among runs)
         max_len = max(len(r["counts"]) for r in recs)
         all_counts = np.zeros((len(recs), max_len), dtype=float)
         for i, r in enumerate(recs):
@@ -1085,21 +1280,19 @@ class InteractiveGaltonApp:
         mean_counts = all_counts.mean(axis=0); std_counts = all_counts.std(axis=0, ddof=0)
         n_levels = max_len - 1
         num_runs = all_counts.shape[0]
-        # choose num_balls from first run if available
         num_balls = recs[0].get("num_balls", int(mean_counts.sum())) if recs else int(mean_counts.sum())
         ks = np.arange(0, max_len); probs = binomial_pmf(n_levels) if n_levels>=0 else []
 
-        # Mean ± std
         self.ax_mean.clear()
         self.ax_mean.bar(ks, mean_counts, yerr=std_counts, alpha=0.85, capsize=3, label="Mean ± std", color=BAR_FILL)
         if len(probs) == len(ks):
             self.ax_mean.plot(ks, np.array(probs)*num_balls, marker='o', linestyle='-', color=ACCENT, label="Expected (binomial)")
         self.ax_mean.set_xlabel("k", fontproperties=GLOBAL_FONT_PROP); self.ax_mean.set_ylabel("Среднее число шариков", fontproperties=GLOBAL_FONT_PROP)
         self.ax_mean.set_title(f"Агрегированная гистограмма ({num_runs} прогонов)", fontproperties=GLOBAL_FONT_PROP)
+        self.ax_mean.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
         self.ax_mean.legend(prop=GLOBAL_FONT_PROP); self.ax_mean.grid(alpha=0.3)
         self.canvas_mean.draw()
 
-        # Normalized comparison
         self.ax_norm.clear()
         mean_probs = mean_counts / mean_counts.sum() if mean_counts.sum()>0 else mean_counts
         width = 0.28
@@ -1108,10 +1301,10 @@ class InteractiveGaltonApp:
             self.ax_norm.bar(ks + width/2, probs, width=width, label="Binomial P(k)", alpha=0.6)
         self.ax_norm.set_xlabel("k", fontproperties=GLOBAL_FONT_PROP); self.ax_norm.set_ylabel("Частота / Вероятность", fontproperties=GLOBAL_FONT_PROP)
         self.ax_norm.set_title("Средние частоты vs теоретическая биномиальная", fontproperties=GLOBAL_FONT_PROP)
+        self.ax_norm.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
         self.ax_norm.legend(prop=GLOBAL_FONT_PROP); self.ax_norm.grid(alpha=0.3)
         self.canvas_norm.draw()
 
-        # Deviations histogram
         self.ax_dev.clear()
         devs = np.array([r.get("avg_rel_dev_pct", float('nan')) for r in recs if r.get("avg_rel_dev_pct") is not None])
         if devs.size > 0:
@@ -1120,7 +1313,6 @@ class InteractiveGaltonApp:
         self.ax_dev.set_title("Распределение AvgRelDev %", fontproperties=GLOBAL_FONT_PROP)
         self.canvas_dev.draw()
 
-        # Pascal table (for n_levels)
         self.ax_pascal.clear()
         coefs = binomial_coefs(n_levels); probs_n = binomial_pmf(n_levels) if n_levels>=0 else []
         col_labels = ["k", "C(n,k)", "P(k)"]
@@ -1135,6 +1327,23 @@ class InteractiveGaltonApp:
                 else:
                     cell.get_text().set_fontproperties(GLOBAL_MONO_FONT_PROP)
         self.canvas_pascal.draw()
+
+    # ---------------- Help dialog ----------------
+    def _open_help(self):
+        d = tk.Toplevel(self.root)
+        d.title("© Иван Голиков")
+        d.geometry("780x640")
+        txt = scrolledtext.ScrolledText(d, wrap='word', font=(_CHOSEN_NAME, 11))
+        txt.pack(fill='both', expand=True, padx=8, pady=8)
+        txt.insert('end', HELP_TEXT + "\n\nОсновные ссылки:\n")
+        for name, url in WIKI_ENTRIES.items():
+            start = txt.index('end-1c')
+            txt.insert('end', f"{name}\n")
+            end = txt.index('end-1c')
+            txt.tag_add(name, start, end)
+            txt.tag_config(name, foreground='blue', underline=1)
+            txt.tag_bind(name, '<Button-1>', lambda e, u=url: webbrowser.open(u))
+        txt.configure(state='disabled')
 
 # ---------------- Main ----------------
 def main():
